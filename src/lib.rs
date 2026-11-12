@@ -5,4 +5,5 @@ pub mod abundance;
 pub mod alias;
 pub mod error;
 pub mod fasta;
+pub mod fragment;
 pub mod rng;
