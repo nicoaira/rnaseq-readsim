@@ -600,11 +600,11 @@ struct ChunkOut {
     truth: Vec<u8>,
 }
 
-fn gzip_member(data: &[u8], level: u32) -> Vec<u8> {
-    let mut encoder = GzEncoder::new(
-        Vec::with_capacity(data.len() / 3 + 64),
-        Compression::new(level),
-    );
+/// Compresses `data` as one gzip member into `out` (whose previous content
+/// is discarded, but whose allocation is reused).
+fn gzip_member(data: &[u8], level: u32, mut out: Vec<u8>) -> Vec<u8> {
+    out.clear();
+    let mut encoder = GzEncoder::new(out, Compression::new(level));
     encoder
         .write_all(data)
         .expect("writing to memory cannot fail");
@@ -631,26 +631,26 @@ impl<'s, 'a> Worker<'s, 'a> {
         }
     }
 
-    fn produce(&mut self, chunk: u64) -> ChunkOut {
+    /// Produces the bytes to write for one chunk. `recycled` is an earlier
+    /// result that has been written; its buffers are used again.
+    fn produce(&mut self, chunk: u64, mut recycled: ChunkOut) -> ChunkOut {
         self.simulator
             .generate_chunk(chunk, &mut self.text, &mut self.counts, &mut self.stats);
         match self.compression {
             Some(level) => ChunkOut {
-                read1: gzip_member(&self.text.read1, level),
-                read2: gzip_member(&self.text.read2, level),
+                read1: gzip_member(&self.text.read1, level, recycled.read1),
+                read2: gzip_member(&self.text.read2, level, recycled.read2),
                 truth: if self.text.truth.is_empty() {
                     Vec::new()
                 } else {
-                    gzip_member(&self.text.truth, level)
+                    gzip_member(&self.text.truth, level, recycled.truth)
                 },
             },
             None => {
-                let capacity = self.text.read1.len();
-                ChunkOut {
-                    read1: std::mem::replace(&mut self.text.read1, Vec::with_capacity(capacity)),
-                    read2: std::mem::replace(&mut self.text.read2, Vec::with_capacity(capacity)),
-                    truth: std::mem::take(&mut self.text.truth),
-                }
+                std::mem::swap(&mut self.text.read1, &mut recycled.read1);
+                std::mem::swap(&mut self.text.read2, &mut recycled.read2);
+                std::mem::swap(&mut self.text.truth, &mut recycled.truth);
+                recycled
             }
         }
     }
@@ -688,6 +688,8 @@ struct State {
     next_assign: u64,
     next_write: u64,
     done: BTreeMap<u64, ChunkOut>,
+    /// Written chunks whose buffers can be used again.
+    spare: Vec<ChunkOut>,
     abort: bool,
 }
 
@@ -728,8 +730,9 @@ fn run_single(
     outputs: &mut Outputs,
 ) -> Result<(Vec<u64>, Stats)> {
     let mut worker = Worker::new(simulator, compression);
+    let mut out = ChunkOut::default();
     for chunk in 0..simulator.num_chunks() {
-        let out = worker.produce(chunk);
+        out = worker.produce(chunk, out);
         outputs.write(&out)?;
     }
     Ok((worker.counts, worker.stats))
@@ -750,6 +753,7 @@ fn run_parallel(
             next_assign: 0,
             next_write: 0,
             done: BTreeMap::new(),
+            spare: Vec::new(),
             abort: false,
         }),
         work: Condvar::new(),
@@ -773,13 +777,13 @@ fn run_parallel(
                                 if st.next_assign < st.next_write + window {
                                     let c = st.next_assign;
                                     st.next_assign += 1;
-                                    break Some(c);
+                                    break Some((c, st.spare.pop().unwrap_or_default()));
                                 }
                                 st = shared.work.wait(st).unwrap_or_else(|e| e.into_inner());
                             }
                         };
-                        let Some(chunk) = chunk else { break };
-                        let out = worker.produce(chunk);
+                        let Some((chunk, spare)) = chunk else { break };
+                        let out = worker.produce(chunk, spare);
                         shared.lock().done.insert(chunk, out);
                         shared.ready.notify_all();
                     }
@@ -810,7 +814,11 @@ fn run_parallel(
                 result = Err(e);
                 break;
             }
-            shared.lock().next_write = chunk + 1;
+            {
+                let mut st = shared.lock();
+                st.next_write = chunk + 1;
+                st.spare.push(out);
+            }
             shared.work.notify_all();
         }
         if result.is_err() {
@@ -1031,7 +1039,7 @@ pub fn run(config: &Config) -> Result<Outcome> {
     if let Some(t) = &mut outputs.truth {
         let header = b"read_name\ttranscript_id\tstart\tfragment_length\tread1_strand\n";
         let data = match compression {
-            Some(level) => gzip_member(header, level),
+            Some(level) => gzip_member(header, level, Vec::new()),
             None => header.to_vec(),
         };
         write_all(t, &data)?;
