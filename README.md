@@ -90,7 +90,7 @@ rnaseq-readsim simulate -t tests/data/transcripts.fa -a tests/data/abundance.tsv
 
 | File | Content |
 |---|---|
-| `<prefix>_1.fastq.gz`, `<prefix>_2.fastq.gz` | Read 1 and read 2, Phred+33, gzip (plain `.fastq` with `--uncompressed`). The gzip files consist of several gzip members, like BGZF files; every common tool reads them. |
+| `<prefix>_1.fastq.gz`, `<prefix>_2.fastq.gz` | Read 1 and read 2, Phred+33, gzip (plain `.fastq` with `--uncompressed`). The gzip files consist of several gzip members (one per 4,096 read pairs), which is valid gzip; `zcat`, Salmon, Trim Galore and FastQC read them (see the validation). |
 | `<prefix>.truth.tsv` | One row per transcript of the FASTA file, in FASTA order: `transcript_id`, `length`, `effective_length`, `abundance` (as given), `expected_fragments` (the model's expectation), `fragments` (simulated). |
 | `<prefix>.report.json` | Program version, every parameter including the seed, the resolved adapter sequences, the size of the inputs and summary numbers: mean, standard deviation, minimum and maximum of the fragment lengths, fragments shorter than the read (adapter read-through), reads that ran past the adapter, whole-transcript fragments, strand counts, substitutions and `N` calls per read. |
 | `<prefix>.reads.tsv.gz` | Only with `--per-read-truth`: `read_name`, `transcript_id`, `start` (1-based position of the fragment in the transcript), `fragment_length`, `read1_strand` (`+` if read 1 is on the transcript strand). Rows are in the order of the FASTQ files. |
@@ -408,18 +408,30 @@ Measured with `scripts/benchmark.sh` on a desktop computer with 8 cores
 (16 hardware threads) and an NVMe solid-state disk, on GENCODE v48 human
 transcripts (412,044 sequences, 412 million bases) with abundances from a
 real sample; 2 × 100 bases, default options, 4 million read pairs per run.
-Each number is the best of three runs, in read pairs per second, and covers
-simulating and writing the reads. Other programs were running on the computer
-during the measurements, and single runs varied by up to about 30 %.
+The numbers are read pairs per second for simulating and writing the reads
+(reading the inputs is not included). Each configuration was run six times,
+in two sessions of three. Other programs were using several cores of the
+computer during all the measurements, so the table gives the fastest run and,
+in parentheses, the slowest. No measurement was made on an idle computer.
 
-@@PERFORMANCE_TABLE@@
+| Threads | Plain FASTQ (`--uncompressed`) | gzip, level 4 (default) | gzip, level 1 |
+|---|---|---|---|
+| 1 | 525,000 (460,000) | 168,000 (114,000) | 373,000 (231,000) |
+| 4 | 2,147,000 (1,669,000) | 555,000 (419,000) | 1,349,000 (891,000) |
+| 8 | 6,437,000 (3,527,000) | 1,187,000 (696,000) | 2,566,000 (1,844,000) |
+
+With 1 thread, generation, compression and writing share that thread; with
+more, the given number of threads generate and compress while the main thread
+writes. Level 1 files were 67 % larger than level 4 files (87 MB against
+52 MB per million reads of one file).
 
 Reading the inputs (a 617 MB uncompressed FASTA file and a 412,044-row
-table) takes a further 1 to 1.5 s per run.
+table) took a further 0.9 to 2 s per run.
 
-Peak memory (maximum resident set size) with these inputs was 0.64 GB with
-1 thread and 0.68 GB with 8 threads, and was the same for 200,000, 2 million
-and 20 million read pairs. About 0.41 GB of it is the transcript sequences.
+Peak memory (maximum resident set size) with these inputs was 0.68 GB with
+8 threads, the same for 200,000, 2 million and 20 million read pairs, and
+0.64 GB with 1 thread (20 million pairs). About 0.41 GB of it is the
+transcript sequences.
 
 The generation of the reads takes about 1.1 to 1.6 µs per pair and thread
 (measured without input and output on a small transcriptome,
