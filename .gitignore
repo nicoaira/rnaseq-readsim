@@ -1,0 +1,18 @@
+# build output
+/target/
+
+# simulator outputs
+*.fastq
+*.fastq.gz
+*.fq
+*.fq.gz
+*.truth.tsv
+*.reads.tsv
+*.reads.tsv.gz
+*.report.json
+
+# editors and operating systems
+.DS_Store
+.idea/
+.vscode/
+*.swp
