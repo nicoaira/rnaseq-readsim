@@ -245,7 +245,7 @@ struct SimulateArgs {
 
     /// Index 2 (i5) sequence, as read 2 reads it: replaces {i5} in the
     /// adapters and is written in the read headers after a '+'. May be empty
-    /// (single-index library)
+    /// (single-index library; then also give that library's --adapter2)
     #[arg(long, default_value = DEFAULT_INDEX2, value_name = "SEQUENCE", help_heading = "Adapters")]
     index2: String,
 

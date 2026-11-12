@@ -5,8 +5,9 @@ use crate::rng::Rng;
 
 /// Default sequence that read 1 runs into past the 3′ end of a short
 /// fragment: the Illumina TruSeq index (i7) adapter, with `{i7}` standing for
-/// the index. Source: Illumina Adapter Sequences, document 1000000002694
-/// (TruSeq single and unique-dual indexes).
+/// the index. Source: Illumina Adapter Sequences, document 1000000002694 v22
+/// (pages "TruSeq Single Indexes" and "IDT for Illumina-TruSeq DNA and RNA
+/// UD Indexes").
 pub const DEFAULT_ADAPTER1: &str = "AGATCGGAAGAGCACACGTCTGAACTCCAGTCAC{i7}ATCTCGTATGCCGTCTTCTGCTTG";
 
 /// Default sequence that read 2 runs into: the reverse complement of the

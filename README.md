@@ -38,8 +38,9 @@ the biases of real libraries; see [What is not simulated](#what-is-not-simulated
 
 ## Build
 
-A stable Rust toolchain is all that is needed (developed with Rust 1.95;
-the code uses the 2024 edition, so Rust 1.85 or later is required).
+A stable Rust toolchain is all that is needed. The program was developed and
+tested with Rust 1.95 only; the code uses the 2024 edition, which needs
+Rust 1.85 or later.
 
 ```bash
 git clone <repository URL>
@@ -132,7 +133,7 @@ FFFFFFFFFF:FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF::FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
 |---|---|---|
 | `-n`, `--num-fragments <N>` | 1000000 | Number of fragments, that is, read pairs. `k`, `M` and `G` suffixes are accepted (`500k`, `2M`, `1.5M`). At most 50 billion. |
 | `-l`, `--library-type <reverse\|forward\|unstranded>` | `reverse` | `reverse`: read 1 is the reverse complement of the transcript and read 2 is on the transcript strand (dUTP protocols, "fr-firststrand"; Salmon calls it ISR, featureCounts `-s 2`). `forward`: read 1 is on the transcript strand (ISF, `-s 1`). `unstranded`: each fragment is `forward` or `reverse` with probability 1/2 (IU). |
-| `-r`, `--read-length <BASES>` | 100 | Length of both reads (1 to 100,000). |
+| `-r`, `--read-length <BASES>` | 100 | Length of both reads (1 to 10,000). |
 | `--fragment-mean <BASES>` | 180 | Mean of the normal fragment-length distribution before truncation. |
 | `--fragment-sd <BASES>` | 55 | Its standard deviation; 0 gives a single length. |
 | `--fragment-min <BASES>` | 40 | Shortest fragment. |
@@ -331,23 +332,26 @@ library. Discrete distributions are sampled with alias tables.
 ## Adapter sequences
 
 The defaults are the Illumina TruSeq adapters with unique dual indexes, as
-used by most stranded RNA-seq kits:
+used by many stranded RNA-seq kits:
 
 | Read | Runs into | Origin |
 |---|---|---|
 | 1 | `AGATCGGAAGAGCACACGTCTGAACTCCAGTCAC` + i7 index + `ATCTCGTATGCCGTCTTCTGCTTG` | The index (i7) adapter `(A)GATCGGAAGAGCACACGTCTGAACTCCAGTCAC[i7]ATCTCGTATGCCGTCTTCTGCTTG`, including the `A` added by A-tailing. |
 | 2 | `AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGT` + i5 index + `GTGTAGATCTCGGTGGTCGCCGTATCATT` | The reverse complement of the i5 adapter `AATGATACGGCGACCACCGAGATCTACAC[i5]ACACTCTTTCCCTACACGACGCTCTTCCGATCT`. |
 
-Source: Illumina, *Illumina Adapter Sequences*, document 1000000002694 v22
-(pages "TruSeq Single Indexes" and "IDT for Illumina–TruSeq DNA and RNA UD
-Indexes",
-<https://support-docs.illumina.com/SHARE/AdapterSequences/Content/SHARE/AdapterSeq/Illumina_DNA/AdapterSequencesIntro.htm>),
-which also gives `AGATCGGAAGAGCACACGTCTGAACTCCAGTCA` and
+Source: Illumina, *Illumina Adapter Sequences*, document 1000000002694 v22,
+pages "TruSeq Single Indexes"
+(<https://support-docs.illumina.com/SHARE/AdapterSequences/Content/SingleIndexes.htm>)
+and "IDT for Illumina–TruSeq DNA and RNA UD Indexes"
+(<https://support-docs.illumina.com/SHARE/AdapterSequences/Content/UDIndexes.htm>).
+The document also gives `AGATCGGAAGAGCACACGTCTGAACTCCAGTCA` and
 `AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGT` as the sequences to trim from read 1 and
 read 2. The Cutadapt user guide lists the same two sequences and explains the
 leading `A` (<https://cutadapt.readthedocs.io/en/stable/guide.html#illumina-truseq>).
 Both were consulted in November 2026. Note that the full read-1 sequence has
 one more base, `C`, between the 33-base trimming sequence and the index. The
+read-through sequences above are the documented oligonucleotides (read 1) or
+their reverse complement (read 2); the program's tests check this. The
 oligonucleotide sequences are © Illumina, Inc.
 
 The default indexes are those of the index pair UDI0001 of the same document:
@@ -369,7 +373,11 @@ Other libraries:
 --index1 ATCACG --index2 '' \
 --adapter2 AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGTAGATCTCGGTGGTCGCCGTATCATT
 
-# Nextera / Illumina DNA Prep style (same Illumina document)
+# Nextera / Illumina Prep kits: the trimming sequence CTGTCTCTTATACACATCT
+# followed by the reverse complement of the index adapters
+# CAAGCAGAAGACGGCATACGAGAT[i7]GTCTCGTGGGCTCGG and
+# AATGATACGGCGACCACCGAGATCTACAC[i5]TCGTCGGCAGCGTC (same document, page
+# "Sequences for Illumina Prep and Nextera Kits"); not tested with a trimmer
 --adapter1 'CTGTCTCTTATACACATCTCCGAGCCCACGAGAC{i7}ATCTCGTATGCCGTCTTCTGCTTG' \
 --adapter2 'CTGTCTCTTATACACATCTGACGCTGCCGACGA{i5}GTGTAGATCTCGGTGGTCGCCGTATCATT'
 
@@ -407,9 +415,7 @@ during the measurements, and single runs varied by up to about 30 %.
 @@PERFORMANCE_TABLE@@
 
 Reading the inputs (a 617 MB uncompressed FASTA file and a 412,044-row
-table) takes a further 1 to 1.5 s per run. For comparison, the simulator of
-RSEM was timed on the same computer at 1 million read pairs in 11 s on one
-core, about 90,000 pairs per second, uncompressed.
+table) takes a further 1 to 1.5 s per run.
 
 Peak memory (maximum resident set size) with these inputs was 0.64 GB with
 1 thread and 0.68 GB with 8 threads, and was the same for 200,000, 2 million
@@ -439,9 +445,12 @@ fragments against Salmon's `NumReads`, for transcripts or genes with at least
 
 | Library type | Detected | Compatible fragments | Mapping rate | Transcripts: Pearson / Spearman | Genes: Pearson / Spearman |
 |---|---|---|---|---|---|
-| `reverse` | ISR | 99.989 % | 97.10 % | 0.914 / 0.958 (n = 19,364) | 0.995 / 0.998 (n = 11,233) |
-| `forward` | ISF | 99.990 % | 97.11 % | 0.914 / 0.958 (n = 19,364) | 0.995 / 0.998 (n = 11,233) |
-| `unstranded` | IU | 100 % | 97.11 % | 0.918 / 0.960 (n = 19,426) | 0.995 / 0.998 (n = 11,222) |
+| `reverse` | ISR | 99.989 % | 97.10 % | 0.9140 / 0.9579 (n = 19,364) | 0.9953 / 0.9977 (n = 11,233) |
+| `forward` | ISF | 99.990 % | 97.11 % | 0.9140 / 0.9581 (n = 19,364) | 0.9953 / 0.9975 (n = 11,233) |
+| `unstranded` | IU | 100 % | 97.11 % | 0.9175 / 0.9595 (n = 19,426) | 0.9953 / 0.9977 (n = 11,222) |
+
+"Compatible fragments" is Salmon's `compatible_fragment_ratio`. The
+transcript-to-gene map came from the GENCODE v48 annotation.
 
 For input abundance (rescaled to TPM) against Salmon's TPM, the `reverse`
 sample gave Pearson 0.947 and Spearman 0.958 at transcript level, and 0.987
@@ -454,8 +463,8 @@ the reads: at gene level the agreement is close.
 The 2.9 % of unmapped pairs are the fragments so short that most of the read
 is adapter. After Trim Galore (below), Salmon mapped 99.99 % of the pairs of
 the `reverse` sample (still ISR, 99.996 % compatible); the median relative
-difference at gene level fell below 0.01 %, and the gene-level correlations
-were 0.995 (Pearson) and 0.998 (Spearman).
+difference at gene level fell below 0.01 % (3.7 % at transcript level), and
+the gene-level correlations were 0.9951 (Pearson) and 0.9981 (Spearman).
 
 ### Trim Galore 2.3.0 (`trim_galore --paired`)
 
@@ -478,7 +487,9 @@ matches, using the fragment lengths from `--per-read-truth`:
 
 For each removed length from 10 to 60 bases, the number of reads differed
 from the number of fragments of the corresponding length by at most 57 (of
-about 400 to 4,000 reads per length).
+about 650 to 4,000 reads per length). The differences are expected: Trim
+Galore first removes low-quality bases, and substitution errors can hide or
+shift an adapter.
 
 ### FastQC 0.12.1
 
@@ -490,14 +501,14 @@ for read 1 and for read 2:
 | Basic Statistics | PASS | Yes. |
 | Per base sequence quality | PASS | Yes: median Q37 at every position, mean falling from 36.4 to 35.5 (read 1) and from 36.2 to 35.0 (read 2). Real runs usually show a small dip in the first cycles as well. |
 | Per tile sequence quality | PASS | Yes, trivially: tiles do not differ. |
-| Per sequence quality scores | PASS | Yes, but the distribution is narrower than in real data: almost all reads have a mean quality of 34 to 36, and there is no tail of bad reads. |
+| Per sequence quality scores | PASS | Yes, but the distribution is narrower than in real data: 95 % of read 1 and 91 % of read 2 have a mean quality of at least 34, about 0.1 % are below 30, and there is no tail of bad reads. |
 | Per base sequence content | PASS | **No.** Real RNA-seq libraries made with random hexamers show a biased composition in the first 10 to 12 bases, and FastQC warns or fails. This bias is not simulated. |
 | Per sequence GC content | PASS | Yes; real libraries pass or warn. |
 | Per base N content | PASS | Yes (no `N` calls by default). |
 | Sequence Length Distribution | PASS | Yes for untrimmed reads. |
 | Sequence Duplication Levels | PASS | At this depth, yes: 78 % of the reads would remain after deduplication. At 20 million read pairs of the same sample FastQC gave WARN (52 % remaining), as real RNA-seq libraries of that depth commonly do. In real data part of the duplication comes from PCR; here all of it comes from drawing many fragments from highly expressed transcripts. |
 | Overrepresented sequences | PASS | Yes for a clean poly(A) library; real libraries sometimes show rRNA or adapter-dimer sequences. |
-| Adapter Content | PASS | Yes: the Illumina Universal Adapter curve rises steadily towards the 3′ end and reaches 4.4 % (FastQC warns from 5 %), as expected with 5.3 % of fragments shorter than 89 bases. |
+| Adapter Content | PASS | Yes: the Illumina Universal Adapter curve rises steadily towards the 3′ end and reaches 4.4 % at positions 88–89, the last ones FastQC can test (it warns from 5 %). In the simulation 4.4 % of the fragments had at most 87 bases and 4.6 % at most 88. |
 
 ### Quality profile learned from real reads
 
@@ -512,9 +523,10 @@ against 1.6 % for read 2).
 ### Determinism
 
 The 2-million-pair `reverse` sample was produced with 1, 3 and 8 threads:
-the MD5 sums of both FASTQ files and of the truth table were identical, and
-so were the reports. The automated tests check the same on a small example
-for gzip and plain output.
+the MD5 sums of both FASTQ files were identical in the three runs, and the
+truth tables and reports of the runs with 1 and 8 threads were identical too.
+The automated tests check the same on a small example with 1, 2 and 5
+threads, for gzip and plain output and for the per-read table.
 
 ### Not checked
 

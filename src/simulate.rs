@@ -32,7 +32,7 @@ use crate::rng::{Rng, threshold_u64};
 pub const CHUNK_FRAGMENTS: u64 = 4096;
 
 /// Longest read that can be simulated.
-pub const MAX_READ_LENGTH: usize = 100_000;
+pub const MAX_READ_LENGTH: usize = 10_000;
 
 /// How the values of the abundance table are interpreted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -315,7 +315,12 @@ impl<'a> Simulator<'a> {
             AbundanceType::Counts => abundances.to_vec(),
         };
         let total_weight: f64 = weights.iter().sum();
-        if total_weight <= 0.0 || !total_weight.is_finite() {
+        if !total_weight.is_finite() {
+            return Err(Error(
+                "the abundances are too large to be added up; rescale them".into(),
+            ));
+        }
+        if total_weight <= 0.0 {
             return Err(Error(
                 "no transcript has a positive abundance: there is nothing to simulate".into(),
             ));
