@@ -43,7 +43,7 @@ tested with Rust 1.95 only; the code uses the 2024 edition, which needs
 Rust 1.85 or later.
 
 ```bash
-git clone <repository URL>
+git clone https://github.com/nicoaira/rnaseq-readsim.git
 cd rnaseq-readsim
 cargo build --release
 # the program is target/release/rnaseq-readsim
