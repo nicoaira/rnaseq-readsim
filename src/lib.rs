@@ -6,6 +6,7 @@ pub mod alias;
 pub mod error;
 pub mod fasta;
 pub mod fragment;
+pub mod names;
 pub mod quality;
 pub mod reads;
 pub mod rng;
