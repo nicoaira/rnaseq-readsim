@@ -855,3 +855,245 @@ fn errors_are_reported_without_a_panic() {
     let version = run(&["--version"]);
     assert!(String::from_utf8_lossy(&version.stdout).contains(env!("CARGO_PKG_VERSION")));
 }
+
+/// Per-read truth rows: transcript id, 1-based start, fragment length, read 1 strand.
+fn per_read_truth(path: &str) -> Vec<(String, usize, usize, char)> {
+    let text = String::from_utf8(gunzip(path)).unwrap();
+    text.lines()
+        .skip(1)
+        .map(|l| {
+            let f: Vec<&str> = l.split('\t').collect();
+            (
+                f[1].to_owned(),
+                f[2].parse().unwrap(),
+                f[3].parse().unwrap(),
+                f[4].chars().next().unwrap(),
+            )
+        })
+        .collect()
+}
+
+fn gc(s: &str) -> f64 {
+    let n = s.bytes().filter(|b| b"ACGT".contains(b)).count().max(1);
+    s.bytes().filter(|b| *b == b'G' || *b == b'C').count() as f64 / n as f64
+}
+
+#[test]
+fn library_biases_are_reproducible_and_thread_independent() {
+    let scratch = Scratch::new("bias-threads");
+    let common = [
+        "-n",
+        "20000",
+        "--per-read-truth",
+        "--seed",
+        "7",
+        "--gc-bias-center",
+        "0.45",
+        "--gc-bias-width",
+        "0.1",
+        "--degradation",
+        "800",
+        "--hexamer-bias",
+        "1",
+        "--library-molecules",
+        "5000",
+    ];
+    let mut files: Vec<Vec<Vec<u8>>> = Vec::new();
+    for threads in ["1", "4"] {
+        let prefix = scratch.path(&format!("t{threads}"));
+        let mut args = common.to_vec();
+        args.extend_from_slice(&["--threads", threads]);
+        assert_success(&simulate(&prefix, &args));
+        files.push(
+            ["_1.fastq.gz", "_2.fastq.gz", ".reads.tsv.gz", ".truth.tsv"]
+                .iter()
+                .map(|ext| read_bytes(&format!("{prefix}{ext}")))
+                .collect(),
+        );
+    }
+    assert_eq!(files[0], files[1], "1 and 4 threads differ");
+    let report = std::fs::read_to_string(scratch.path("t1.report.json")).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&report).unwrap();
+    let summary = &json["summary"];
+    assert_eq!(summary["fragments"], 20000);
+    assert!(summary["candidate_fragments"].as_u64().unwrap() > 20000);
+    let kept = summary["fraction_of_candidates_kept"].as_f64().unwrap();
+    assert!(kept > 0.0 && kept < 1.0);
+    let unique = summary["expected_unique_fraction"].as_f64().unwrap();
+    assert!((unique - 5000.0 * (1.0 - (-4.0f64).exp()) / 20000.0).abs() < 1e-9);
+    assert_eq!(json["parameters"]["library_molecules"], 5000);
+    assert_eq!(json["parameters"]["degradation"], 800.0);
+}
+
+#[test]
+fn a_limited_library_gives_duplicates_of_the_same_fragment() {
+    let scratch = Scratch::new("molecules");
+    let prefix = scratch.path("dup");
+    assert_success(&simulate(
+        &prefix,
+        &[
+            "-n",
+            "20000",
+            "--per-read-truth",
+            "--library-molecules",
+            "2000",
+            "--seed",
+            "3",
+        ],
+    ));
+    let rows = per_read_truth(&format!("{prefix}.reads.tsv.gz"));
+    let mut distinct: HashMap<(String, usize, usize, char), usize> = HashMap::new();
+    for r in &rows {
+        *distinct.entry(r.clone()).or_default() += 1;
+    }
+    // at most 2,000 molecules; with 20,000 draws nearly all of them appear
+    assert!(
+        distinct.len() <= 2000,
+        "{} distinct fragments",
+        distinct.len()
+    );
+    assert!(
+        distinct.len() > 1900,
+        "{} distinct fragments",
+        distinct.len()
+    );
+    // a duplicate has the same sequence apart from sequencing errors: compare
+    // the reads of one molecule base by base
+    let reads = fastq(&gunzip(&format!("{prefix}_1.fastq.gz")));
+    let first = &rows[0];
+    let same: Vec<usize> = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| *r == first)
+        .map(|(i, _)| i)
+        .collect();
+    assert!(same.len() >= 2);
+    let a = reads[same[0]].seq.as_bytes();
+    let b = reads[same[1]].seq.as_bytes();
+    let diff = a.iter().zip(b).filter(|(x, y)| x != y).count();
+    assert!(
+        diff <= 5,
+        "two reads of one molecule differ at {diff} bases"
+    );
+    // without the option every read pair is its own molecule
+    let free = scratch.path("free");
+    assert_success(&simulate(
+        &free,
+        &["-n", "20000", "--per-read-truth", "--seed", "3"],
+    ));
+    let rows = per_read_truth(&format!("{free}.reads.tsv.gz"));
+    let distinct: std::collections::HashSet<_> = rows.iter().collect();
+    assert!(distinct.len() > 15000);
+}
+
+#[test]
+fn degradation_moves_fragments_to_the_three_prime_end() {
+    let scratch = Scratch::new("degradation");
+    let tx = transcripts();
+    let mean_rel = |prefix: &str| -> f64 {
+        let rows = per_read_truth(&format!("{prefix}.reads.tsv.gz"));
+        let long: Vec<f64> = rows
+            .iter()
+            .filter(|r| r.0 == "TOY0001.1")
+            .map(|r| (r.1 - 1 + r.2 / 2) as f64 / tx["TOY0001.1"].len() as f64)
+            .collect();
+        long.iter().sum::<f64>() / long.len() as f64
+    };
+    let intact = scratch.path("intact");
+    assert_success(&simulate(
+        &intact,
+        &["-n", "20000", "--per-read-truth", "--seed", "5"],
+    ));
+    let degraded = scratch.path("degraded");
+    assert_success(&simulate(
+        &degraded,
+        &[
+            "-n",
+            "20000",
+            "--per-read-truth",
+            "--seed",
+            "5",
+            "--degradation",
+            "300",
+        ],
+    ));
+    let (a, b) = (mean_rel(&intact), mean_rel(&degraded));
+    assert!((a - 0.5).abs() < 0.05, "intact: mean relative position {a}");
+    // 3' pieces of mean 300 bases on a 2,400-base transcript: fragment centres near 0.84
+    assert!(b > 0.8, "degraded: mean relative position {b}");
+    // long transcripts give fewer fragments when only 3' pieces are kept
+    let share = |prefix: &str| -> f64 {
+        let rows = per_read_truth(&format!("{prefix}.reads.tsv.gz"));
+        rows.iter().filter(|r| r.0 == "TOY0001.1").count() as f64 / rows.len() as f64
+    };
+    assert!(share(&degraded) < 0.7 * share(&intact));
+}
+
+#[test]
+fn gc_and_hexamer_biases_change_the_reads() {
+    let scratch = Scratch::new("gc-hexamer");
+    let mean_gc = |prefix: &str| -> f64 {
+        let reads = fastq(&gunzip(&format!("{prefix}_2.fastq.gz")));
+        reads.iter().map(|r| gc(&r.seq[20..80])).sum::<f64>() / reads.len() as f64
+    };
+    let plain = scratch.path("plain");
+    assert_success(&simulate(&plain, &["-n", "20000", "--seed", "11"]));
+    let low = scratch.path("low");
+    assert_success(&simulate(
+        &low,
+        &[
+            "-n",
+            "20000",
+            "--seed",
+            "11",
+            "--gc-bias-center",
+            "0.3",
+            "--gc-bias-width",
+            "0.08",
+        ],
+    ));
+    assert!(
+        mean_gc(&low) < mean_gc(&plain) - 0.03,
+        "{} vs {}",
+        mean_gc(&low),
+        mean_gc(&plain)
+    );
+
+    // random-hexamer bias: the base mix of the first positions of read 1
+    // departs from the mix further along the read
+    let hex = scratch.path("hex");
+    assert_success(&simulate(
+        &hex,
+        &["-n", "20000", "--seed", "11", "--hexamer-bias", "1"],
+    ));
+    let share_a = |prefix: &str, pos: usize| -> f64 {
+        let reads = fastq(&gunzip(&format!("{prefix}_1.fastq.gz")));
+        reads
+            .iter()
+            .filter(|r| r.seq.as_bytes()[pos] == b'A')
+            .count() as f64
+            / reads.len() as f64
+    };
+    let skew = share_a(&hex, 0) - share_a(&hex, 50);
+    let control = share_a(&plain, 0) - share_a(&plain, 50);
+    assert!(skew > 0.05, "A at position 1 vs 51: {skew}");
+    assert!(control.abs() < 0.03, "without bias: {control}");
+}
+
+#[test]
+fn bad_bias_settings_are_errors() {
+    let scratch = Scratch::new("bias-errors");
+    let prefix = scratch.path("x");
+    for extra in [
+        vec!["--gc-bias-center", "1.2"],
+        vec!["--gc-bias-center", "0.5", "--gc-bias-width", "0"],
+        vec!["--degradation", "0"],
+        vec!["--hexamer-bias", "-1"],
+        vec!["--library-molecules", "0"],
+    ] {
+        let out = simulate(&prefix, &extra);
+        assert!(!out.status.success(), "{extra:?} was accepted");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(!err.contains("panicked"), "{extra:?}: {err}");
+    }
+}

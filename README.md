@@ -16,8 +16,12 @@ simulated (the "truth") so that the results of a pipeline can be checked.
 - Millions of read pairs per second (see [Performance](#performance)).
 
 It is meant for teaching, for testing pipelines and for benchmarks in which a
-simple, fully documented model is an advantage. It does not try to reproduce
-the biases of real libraries; see [What is not simulated](#what-is-not-simulated).
+simple, fully documented model is an advantage. Without options it simulates
+an unbiased library. Four optional [library biases](#library-biases) bring
+the reads closer to real libraries and let two libraries of the same sample
+differ like two library-prep kits (a batch effect): fragment GC preference,
+RNA degradation (3′ bias), random-hexamer priming bias and limited library
+complexity (PCR duplicates). See also [What is not simulated](#what-is-not-simulated).
 
 ## Contents
 
@@ -151,6 +155,18 @@ FFFFFFFFFF:FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF::FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
 
 See [Adapter sequences](#adapter-sequences) for the origin of the defaults and
 for single-index and Nextera libraries.
+
+### Library biases
+
+All off by default; see [Library biases](#library-biases) for the model.
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--gc-bias-center <CENTER>` | none | Fragment GC fraction the library favours (0 to 1). A candidate fragment is kept with probability *exp(−((gc − CENTER) / WIDTH)² / 2)*. |
+| `--gc-bias-width <WIDTH>` | 0.15 | Width of that preference (a standard deviation, in GC fraction). |
+| `--degradation <BASES>` | none | RNA degradation: poly(A) selection keeps 3′ pieces of mean length *BASES*; a fragment that starts *d* bases before the 3′ end of its transcript is kept with probability *exp(−d / BASES)*. |
+| `--hexamer-bias <STRENGTH>` | 0 | Random-hexamer priming bias over the first 9 bases of each read: 0 = none, 1 = the built-in weights (read 2 gets half the strength), up to 3. |
+| `--library-molecules <N>` | unlimited | Number of different molecules in the library; every read pair is drawn from them with replacement, so molecules drawn more than once give duplicates. `k`, `M` and `G` suffixes are accepted. |
 
 ### Qualities and errors
 
@@ -292,18 +308,63 @@ size-selected with *g*. Three consequences are worth knowing:
   about 0.001 % of the fragments (10 of 2 million).
 - A transcript of abundance 0 never yields a fragment.
 
+## Library biases
+
+A bias is a probability of keeping a candidate fragment. A candidate (steps
+1 to 3 above: transcript, length, start, strand) is kept with the product of
+the probabilities of the active biases; otherwise a new candidate is drawn
+from step 1, transcript included. A bias therefore changes how many
+fragments each transcript gives, as it does in a real library, and not only
+where the fragments lie. The number of read pairs is unchanged; the report
+gives `candidate_fragments` and `fraction_of_candidates_kept`. The
+`expected_fragments` column of the truth table stays the expectation without
+biases; the `fragments` column counts what was simulated.
+
+- **Fragment GC content.** *exp(−((gc − c) / w)² / 2)*, *gc* being the share of
+  G and C among the A, C, G and T of the fragment. PCR and fragmentation
+  favour fragments of intermediate GC content; how strongly differs between
+  protocols and kits.
+- **Degradation.** Poly(A) selection of partly degraded RNA keeps only the 3′
+  piece of each molecule. With pieces of exponentially distributed length
+  (mean *m*), a fragment starting *d* bases before the 3′ end of its
+  transcript lies inside the kept piece with probability *exp(−d / m)*.
+  Coverage rises towards the 3′ end, long transcripts give fewer fragments,
+  and with a short *m* many fragments are shorter than the read (combine with
+  a lower `--fragment-mean`).
+- **Random-hexamer priming.** A weight matrix over the first nine bases of
+  each read (columns A, C, G, T; the largest weight of each position is 1)
+  gives the probability of keeping the fragment; *strength* raises every
+  weight to that power, and read 2 uses half of it. The built-in weights are
+  made up: they give position-dependent base compositions of the kind random
+  priming produces (FastQC's "Per base sequence content" fails for read 1),
+  not the profile of a particular kit.
+- **Library complexity.** The library holds *M* molecules; each read pair
+  picks one uniformly at random, with replacement. Molecule *i* is drawn from
+  its own random stream (derived from the seed and *i*), with all the biases,
+  so every read pair of a molecule has the same fragment, strand and adapter
+  read-through; qualities and sequencing errors are drawn per read pair. The
+  expected share of read pairs that are the first of their molecule is
+  *M (1 − e^(−N/M)) / N* for *N* read pairs (`expected_unique_fraction` in the
+  report). Amplification is uniform: there is no PCR bias between molecules.
+
+With any bias, the output is different from that of the same seed without
+biases, and still identical for any number of threads.
+
 **Random numbers.** xoshiro256++ generators seeded through SplitMix64, both
 implemented in the program so that results do not depend on the version of a
 library. Discrete distributions are sampled with alias tables.
 
 ## What is not simulated
 
-- **Sequence-specific and positional biases**: no random-hexamer priming
-  bias at the start of reads, no GC bias, no 5′/3′ coverage bias, no
-  degradation. Coverage is uniform along each transcript apart from the edge
-  effect of the fragment length.
-- **PCR duplicates**: none beyond the duplicates that arise by chance when
-  many fragments are drawn from a short or highly expressed transcript.
+- **Sequence-specific and positional biases, without the options above**: no
+  random-hexamer priming bias, no GC bias, no 5′/3′ coverage bias, no
+  degradation. With them, each bias is the simple model described in
+  [Library biases](#library-biases); there is no 5′ bias, no bias from RNA
+  secondary structure and no position-specific fragmentation.
+- **PCR duplicates without `--library-molecules`**: none beyond the
+  duplicates that arise by chance when many fragments are drawn from a short
+  or highly expressed transcript. With it, amplification is uniform across
+  molecules.
 - **Indels**: errors are substitutions only. There are no homopolymer errors.
 - **Poly(A) tails**: transcripts are used as they are in the FASTA file. Add
   tails to the sequences if you need them.

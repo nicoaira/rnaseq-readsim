@@ -7,6 +7,7 @@
 
 pub mod abundance;
 pub mod alias;
+pub mod bias;
 pub mod error;
 pub mod fasta;
 pub mod fragment;

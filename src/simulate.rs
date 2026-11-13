@@ -19,13 +19,14 @@ use serde::Serialize;
 
 use crate::abundance::read_abundances;
 use crate::alias::AliasTable;
+use crate::bias::{BiasSettings, Biases, accept, expected_unique_fraction};
 use crate::error::{Context, Error, Result};
 use crate::fasta::Transcriptome;
 use crate::fragment::FragmentModel;
 use crate::names::{MAX_FRAGMENTS, NameLayout, push_decimal};
 use crate::quality::{Profile, QualitySampler, ReadErrors, builtin_profile};
 use crate::reads::{AdapterFill, LibraryType, build_read, parse_nucleotides, resolve_adapter};
-use crate::rng::{Rng, threshold_u64};
+use crate::rng::{Rng, mix64, threshold_u64};
 
 /// Number of fragments per chunk. Part of the definition of the output: do
 /// not change it without changing the version of the program.
@@ -80,7 +81,16 @@ pub struct ReadParameters {
     pub flowcell: String,
     pub lane: u32,
     pub per_read_truth: bool,
+    /// Which candidate fragments the library keeps (see [`crate::bias`]).
+    pub biases: BiasSettings,
+    /// Number of different molecules in the library; `None` draws a new
+    /// molecule for every read pair (no duplicates beyond chance).
+    pub library_molecules: Option<u64>,
 }
+
+/// Candidates drawn in a row without one being kept, after which the
+/// simulation stops: the biases leave almost nothing to keep.
+pub const MAX_REJECTIONS: u64 = 100_000_000;
 
 impl Default for ReadParameters {
     fn default() -> Self {
@@ -104,6 +114,13 @@ impl Default for ReadParameters {
             flowcell: "H7SIMDSXX".to_owned(),
             lane: 1,
             per_read_truth: false,
+            biases: BiasSettings {
+                gc_center: None,
+                gc_width: 0.15,
+                degradation: None,
+                hexamer: 0.0,
+            },
+            library_molecules: None,
         }
     }
 }
@@ -130,6 +147,8 @@ pub struct Stats {
     pub read1_on_transcript_strand: u64,
     pub substitutions: [u64; 2],
     pub n_calls: [u64; 2],
+    /// Candidate fragments drawn (equal to `fragments` without biases).
+    pub candidates: u64,
 }
 
 impl Default for Stats {
@@ -147,6 +166,7 @@ impl Default for Stats {
             read1_on_transcript_strand: 0,
             substitutions: [0; 2],
             n_calls: [0; 2],
+            candidates: 0,
         }
     }
 }
@@ -163,6 +183,7 @@ impl Stats {
         self.read2_past_adapter += other.read2_past_adapter;
         self.whole_transcript += other.whole_transcript;
         self.read1_on_transcript_strand += other.read1_on_transcript_strand;
+        self.candidates += other.candidates;
         for i in 0..2 {
             self.substitutions[i] += other.substitutions[i];
             self.n_calls[i] += other.n_calls[i];
@@ -231,6 +252,10 @@ pub struct Simulator<'a> {
     effective_lengths: Vec<f64>,
     /// Probability that a fragment comes from each transcript.
     probabilities: Vec<f64>,
+    biases: Biases,
+    molecules: Option<u64>,
+    /// Seed of the per-molecule random streams.
+    molecule_seed: u64,
 }
 
 fn check_name_field(value: &str, what: &str) -> Result<()> {
@@ -290,6 +315,10 @@ impl<'a> Simulator<'a> {
         }
         check_name_field(&p.instrument, "instrument name")?;
         check_name_field(&p.flowcell, "flow cell name")?;
+        let biases = Biases::new(&p.biases).map_err(Error)?;
+        if p.library_molecules == Some(0) {
+            return Err(Error("the library must hold at least one molecule".into()));
+        }
 
         let fragment = FragmentModel::new(
             p.fragment_mean,
@@ -374,7 +403,51 @@ impl<'a> Simulator<'a> {
             per_read_truth: p.per_read_truth,
             effective_lengths,
             probabilities,
+            biases,
+            molecules: p.library_molecules,
+            molecule_seed: mix64(p.seed ^ 0x6D6F_6C65_6375_6C65),
         })
+    }
+
+    /// Draws one fragment of the library: transcript, start, length, whether
+    /// it is the whole transcript, and whether read 1 is on the transcript
+    /// strand. Candidates are drawn as without biases and kept with the
+    /// probability the biases give.
+    fn draw_fragment(&self, rng: &mut Rng, stats: &mut Stats) -> (usize, usize, usize, bool, bool) {
+        let mut rejected = 0u64;
+        loop {
+            let t = self.transcripts.sample(rng);
+            let transcript = self.transcriptome.sequence(t);
+            let tlen = transcript.len();
+            let (start, flen, whole) = loop {
+                let l = self.fragment.sample(rng);
+                let p = rng.below(tlen as u64) as usize;
+                if l <= tlen {
+                    if p + l <= tlen {
+                        break (p, l, false);
+                    }
+                } else if p == 0 {
+                    break (0, tlen, true);
+                }
+            };
+            let read1_forward = self.library_type.read1_on_transcript_strand(rng);
+            stats.candidates += 1;
+            let keep = self.biases.keep_probability(
+                &transcript[start..start + flen],
+                start,
+                tlen,
+                read1_forward,
+            );
+            if accept(rng, keep) {
+                return (t, start, flen, whole, read1_forward);
+            }
+            rejected += 1;
+            assert!(
+                rejected < MAX_REJECTIONS,
+                "{MAX_REJECTIONS} candidate fragments in a row were rejected: the library biases \
+                 leave almost nothing to keep (loosen --gc-bias-width or --degradation)"
+            );
+        }
     }
 
     pub fn total_fragments(&self) -> u64 {
@@ -431,44 +504,80 @@ impl<'a> Simulator<'a> {
         out.read1.reserve(record * n as usize);
         out.read2.reserve(record * n as usize);
 
+        let plain = !self.biases.is_active() && self.molecules.is_none();
         for _ in 0..n {
-            // 1. transcript, 2. fragment length and start (rejection sampling
-            // of a uniform (start, length) pair inside the transcript).
-            let t = self.transcripts.sample(&mut rng);
-            let transcript = self.transcriptome.sequence(t);
-            let tlen = transcript.len();
-            let (start, flen, whole) = loop {
-                let l = self.fragment.sample(&mut rng);
-                let p = rng.below(tlen as u64) as usize;
-                if l <= tlen {
-                    if p + l <= tlen {
-                        break (p, l, false);
+            let (t, start, flen, whole, read1_forward);
+            if plain {
+                // 1. transcript, 2. fragment length and start (rejection
+                // sampling of a uniform (start, length) pair inside the
+                // transcript).
+                t = self.transcripts.sample(&mut rng);
+                let transcript = self.transcriptome.sequence(t);
+                let tlen = transcript.len();
+                (start, flen, whole) = loop {
+                    let l = self.fragment.sample(&mut rng);
+                    let p = rng.below(tlen as u64) as usize;
+                    if l <= tlen {
+                        if p + l <= tlen {
+                            break (p, l, false);
+                        }
+                    } else if p == 0 {
+                        break (0, tlen, true);
                     }
-                } else if p == 0 {
-                    break (0, tlen, true);
-                }
-            };
-            counts[t] += 1;
-            let fragment = &transcript[start..start + flen];
+                };
+                stats.candidates += 1;
+                let fragment = &transcript[start..start + flen];
 
-            // 3. strand, 4. the two error-free reads.
-            let read1_forward = self.library_type.read1_on_transcript_strand(&mut rng);
-            build_read(
-                &mut template1,
-                fragment,
-                read1_forward,
-                &self.adapter1,
-                self.fill,
-                &mut rng,
-            );
-            build_read(
-                &mut template2,
-                fragment,
-                !read1_forward,
-                &self.adapter2,
-                self.fill,
-                &mut rng,
-            );
+                // 3. strand, 4. the two error-free reads.
+                read1_forward = self.library_type.read1_on_transcript_strand(&mut rng);
+                build_read(
+                    &mut template1,
+                    fragment,
+                    read1_forward,
+                    &self.adapter1,
+                    self.fill,
+                    &mut rng,
+                );
+                build_read(
+                    &mut template2,
+                    fragment,
+                    !read1_forward,
+                    &self.adapter2,
+                    self.fill,
+                    &mut rng,
+                );
+            } else {
+                // A molecule of the library: drawn from its own stream when
+                // the library holds a limited number of molecules, so that a
+                // duplicate is the same fragment.
+                let mut molecule_rng;
+                let frng: &mut Rng = match self.molecules {
+                    Some(m) => {
+                        molecule_rng = Rng::for_stream(self.molecule_seed, rng.below(m));
+                        &mut molecule_rng
+                    }
+                    None => &mut rng,
+                };
+                (t, start, flen, whole, read1_forward) = self.draw_fragment(frng, stats);
+                let fragment = &self.transcriptome.sequence(t)[start..start + flen];
+                build_read(
+                    &mut template1,
+                    fragment,
+                    read1_forward,
+                    &self.adapter1,
+                    self.fill,
+                    frng,
+                );
+                build_read(
+                    &mut template2,
+                    fragment,
+                    !read1_forward,
+                    &self.adapter2,
+                    self.fill,
+                    frng,
+                );
+            }
+            counts[t] += 1;
 
             // 5. name, 6. qualities and errors.
             let (tile, x, y) = cursor.next_coordinates(&mut rng);
@@ -881,6 +990,11 @@ struct ReportParameters<'a> {
     compression: &'a str,
     compression_level: Option<u32>,
     per_read_truth: bool,
+    gc_bias_center: Option<f64>,
+    gc_bias_width: Option<f64>,
+    degradation: Option<f64>,
+    hexamer_bias: f64,
+    library_molecules: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -919,6 +1033,12 @@ struct ReportSummary {
     fraction_read1_on_transcript_strand: f64,
     read1: ReportRead,
     read2: ReportRead,
+    /// Candidate fragments drawn; above `fragments` when biases reject some.
+    candidate_fragments: u64,
+    fraction_of_candidates_kept: f64,
+    /// Expected share of read pairs that are the first read of their
+    /// molecule (with --library-molecules).
+    expected_unique_fraction: Option<f64>,
 }
 
 #[derive(Serialize)]
@@ -1133,6 +1253,15 @@ pub fn run(config: &Config) -> Result<Outcome> {
             compression: if config.compress { "gzip" } else { "none" },
             compression_level: compression,
             per_read_truth: config.reads.per_read_truth,
+            gc_bias_center: config.reads.biases.gc_center,
+            gc_bias_width: config
+                .reads
+                .biases
+                .gc_center
+                .map(|_| config.reads.biases.gc_width),
+            degradation: config.reads.biases.degradation,
+            hexamer_bias: config.reads.biases.hexamer,
+            library_molecules: config.reads.library_molecules,
         },
         resolved_adapter1: String::from_utf8_lossy(adapter1).into_owned(),
         resolved_adapter2: String::from_utf8_lossy(adapter2).into_owned(),
@@ -1174,6 +1303,12 @@ pub fn run(config: &Config) -> Result<Outcome> {
                 substitution_rate: fraction(stats.substitutions[1], read_bases),
                 n_calls: stats.n_calls[1],
             },
+            candidate_fragments: stats.candidates,
+            fraction_of_candidates_kept: fraction(stats.fragments, stats.candidates),
+            expected_unique_fraction: config
+                .reads
+                .library_molecules
+                .map(|m| expected_unique_fraction(stats.fragments, m)),
         },
         outputs: ReportOutputs {
             read1: &read1_path,

@@ -5,6 +5,7 @@ use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
+use rnaseq_readsim::bias::BiasSettings;
 use rnaseq_readsim::error::{Context, Error, Result};
 use rnaseq_readsim::quality::{
     PROFILE_FORMAT, PROFILE_VERSION, Profile, ReadProfile, learn_from_fastq,
@@ -279,6 +280,43 @@ struct SimulateArgs {
     )]
     n_rate: f64,
 
+    /// Fragment GC fraction the library favours, between 0 and 1: candidate
+    /// fragments are kept with probability exp(-((gc - CENTER) / WIDTH)^2 / 2)
+    /// [default: no GC bias]
+    #[arg(long, value_name = "CENTER", help_heading = "Library biases")]
+    gc_bias_center: Option<f64>,
+
+    /// Width of the GC preference (a standard deviation, in GC fraction)
+    #[arg(
+        long,
+        default_value_t = 0.15,
+        value_name = "WIDTH",
+        help_heading = "Library biases"
+    )]
+    gc_bias_width: f64,
+
+    /// RNA degradation: poly(A) selection keeps 3' pieces of mean length
+    /// BASES; a fragment starting d bases before the 3' end is kept with
+    /// probability exp(-d / BASES) [default: intact RNA]
+    #[arg(long, value_name = "BASES", help_heading = "Library biases")]
+    degradation: Option<f64>,
+
+    /// Strength of the random-hexamer priming bias at the start of the reads:
+    /// 0 = none, 1 = the built-in weights (read 2 gets half)
+    #[arg(
+        long,
+        default_value_t = 0.0,
+        value_name = "STRENGTH",
+        help_heading = "Library biases"
+    )]
+    hexamer_bias: f64,
+
+    /// Number of different molecules in the library: read pairs are drawn
+    /// from them with replacement, giving PCR duplicates. k, M and G suffixes
+    /// are accepted [default: unlimited, no duplicates beyond chance]
+    #[arg(long, value_name = "N", value_parser = parse_count, help_heading = "Library biases")]
+    library_molecules: Option<u64>,
+
     /// Instrument name in the read names
     #[arg(
         long,
@@ -411,6 +449,13 @@ fn run_simulate(args: SimulateArgs) -> Result<()> {
             flowcell: args.flowcell,
             lane: args.lane,
             per_read_truth: args.per_read_truth,
+            biases: BiasSettings {
+                gc_center: args.gc_bias_center,
+                gc_width: args.gc_bias_width,
+                degradation: args.degradation,
+                hexamer: args.hexamer_bias,
+            },
+            library_molecules: args.library_molecules,
         },
         threads,
         compress: !args.uncompressed,
