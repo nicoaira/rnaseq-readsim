@@ -465,39 +465,53 @@ have only been compared on one platform (x86-64 Linux).
 
 ## Performance
 
-Measured with `scripts/benchmark.sh` on a desktop computer with 8 cores
-(16 hardware threads) and an NVMe solid-state disk, on GENCODE v48 human
-transcripts (412,044 sequences, 412 million bases) with abundances from a
-real sample; 2 × 100 bases, default options, 4 million read pairs per run.
-The numbers are read pairs per second for simulating and writing the reads
-(reading the inputs is not included). Each configuration was run six times,
-in two sessions of three. Other programs were using several cores of the
-computer during all the measurements, so the table gives the fastest run and,
-in parentheses, the slowest. No measurement was made on an idle computer.
+Measured on 2026-11-13 with `scripts/benchmark.sh` and version 0.2.0 (release
+build, rustc 1.95.0) on a laptop with an Intel Core i7-11800H (8 cores, 16
+hardware threads, up to 4.6 GHz), 64 GB of memory and an NVMe solid-state
+disk, running Linux. The computer was otherwise idle (a web browser used
+about one core). Inputs: GENCODE release 50 human transcripts (670,670
+sequences, 1.48 billion bases, a 1.6 GB uncompressed FASTA file) and an
+abundance table of 389,774 transcripts from a simulated sample; 2 × 100
+bases, 4 million read pairs per run. The numbers are read pairs per second for
+simulating and writing the reads (reading the inputs is not included); each
+configuration was run five times, and the table gives the fastest run and,
+in parentheses, the slowest.
 
 | Threads | Plain FASTQ (`--uncompressed`) | gzip, level 4 (default) | gzip, level 1 |
 |---|---|---|---|
-| 1 | 525,000 (460,000) | 168,000 (114,000) | 373,000 (231,000) |
-| 4 | 2,147,000 (1,669,000) | 555,000 (419,000) | 1,349,000 (891,000) |
-| 8 | 6,437,000 (3,527,000) | 1,187,000 (696,000) | 2,566,000 (1,844,000) |
+| 1 | 866,000 (771,000) | 185,000 (145,000) | 368,000 (312,000) |
+| 4 | 2,974,000 (2,803,000) | 665,000 (624,000) | 1,317,000 (1,274,000) |
+| 8 | 5,947,000 (5,251,000) | 1,149,000 (1,073,000) | 2,552,000 (2,488,000) |
+| 16 | 6,879,000 (3,616,000) | 1,402,000 (923,000) | 3,576,000 (3,370,000) |
 
 With 1 thread, generation, compression and writing share that thread; with
 more, the given number of threads generate and compress while the main thread
-writes. Level 1 files were 67 % larger than level 4 files (87 MB against
-52 MB per million reads of one file).
+writes. Up to 8 threads (one per core) the runs agree within about 10 %;
+with 16 threads two threads share each core and the speed varied by up to a
+factor of two between runs, so the gain over 8 threads is uncertain. With
+gzip output most of the time is spent compressing.
 
-Reading the inputs (a 617 MB uncompressed FASTA file and a 412,044-row
-table) took a further 0.9 to 2 s per run.
+**With library biases** every kept fragment costs the candidates that were
+rejected before it, so the speed falls with the fraction kept (best of three
+runs, 4 million read pairs; the last row 1 million):
 
-Peak memory (maximum resident set size) with these inputs was 0.68 GB with
-8 threads, the same for 200,000, 2 million and 20 million read pairs, and
-0.64 GB with 1 thread (20 million pairs). About 0.41 GB of it is the
-transcript sequences.
+| Settings | Candidates kept | 1 thread, plain | 1 thread, gzip 4 | 8 threads, plain | 8 threads, gzip 4 |
+|---|---|---|---|---|---|
+| `--gc-bias-center 0.50 --gc-bias-width 0.22 --hexamer-bias 1 --degradation 5000 --library-molecules 24M` | 5.8 % | 58,600 | 47,400 | 390,000 | 307,000 |
+| as above with `--degradation 350 --fragment-mean 125 --fragment-sd 40 --library-molecules 350k` (degraded RNA) | 0.76 % | 10,500 | 10,300 | 74,100 | 71,700 |
 
-The generation of the reads takes about 1.1 to 1.6 µs per pair and thread
-(measured without input and output on a small transcriptome,
-`cargo test --release -- --ignored --nocapture throughput`); with gzip output
-most of the time is spent compressing.
+At these speeds a library of 25 million read pairs with the first settings takes
+about 1.5 minutes with 8 threads, and with the second about 6 minutes.
+
+Reading the inputs took 1.7 to 2.2 s per run. Peak memory (maximum resident
+set size) was 1.53 GB with 1 thread and 1.6 to 1.8 GB with 4 to 16 threads;
+most of it is the 1.48 billion bases of the transcript sequences, and it does
+not grow with the number of reads or with `--library-molecules` (molecules
+are regenerated from their own random streams, not stored).
+
+The generation of the reads alone takes 0.79 to 0.82 µs per pair and thread
+(three runs without input and output on a small transcriptome,
+`cargo test --release -- --ignored --nocapture throughput`).
 
 ## Validation with real tools
 
