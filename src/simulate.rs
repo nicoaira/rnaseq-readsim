@@ -86,6 +86,12 @@ pub struct ReadParameters {
     /// Number of different molecules in the library; `None` draws a new
     /// molecule for every read pair (no duplicates beyond chance).
     pub library_molecules: Option<u64>,
+    /// Fraction of fragments drawn from the optional background FASTA
+    /// (e.g. rRNA, pseudogenes, multicopy transcripts).
+    pub background_rate: f64,
+    /// Fraction of fragments simulated as unmappable non-reference or
+    /// heavily diverged sequencing artifacts.
+    pub unmapped_rate: f64,
 }
 
 /// Candidates drawn in a row without one being kept, after which the
@@ -121,6 +127,8 @@ impl Default for ReadParameters {
                 hexamer: 0.0,
             },
             library_molecules: None,
+            background_rate: 0.0,
+            unmapped_rate: 0.0,
         }
     }
 }
@@ -149,6 +157,10 @@ pub struct Stats {
     pub n_calls: [u64; 2],
     /// Candidate fragments drawn (equal to `fragments` without biases).
     pub candidates: u64,
+    /// Fragments drawn from the background FASTA.
+    pub background_fragments: u64,
+    /// Fragments simulated as unmappable artifacts.
+    pub unmapped_fragments: u64,
 }
 
 impl Default for Stats {
@@ -167,6 +179,8 @@ impl Default for Stats {
             substitutions: [0; 2],
             n_calls: [0; 2],
             candidates: 0,
+            background_fragments: 0,
+            unmapped_fragments: 0,
         }
     }
 }
@@ -184,6 +198,8 @@ impl Stats {
         self.whole_transcript += other.whole_transcript;
         self.read1_on_transcript_strand += other.read1_on_transcript_strand;
         self.candidates += other.candidates;
+        self.background_fragments += other.background_fragments;
+        self.unmapped_fragments += other.unmapped_fragments;
         for i in 0..2 {
             self.substitutions[i] += other.substitutions[i];
             self.n_calls[i] += other.n_calls[i];
@@ -256,6 +272,9 @@ pub struct Simulator<'a> {
     molecules: Option<u64>,
     /// Seed of the per-molecule random streams.
     molecule_seed: u64,
+    background: Option<(&'a Transcriptome, AliasTable)>,
+    unmapped_threshold: u64,
+    background_threshold: u64,
 }
 
 fn check_name_field(value: &str, what: &str) -> Result<()> {
@@ -311,6 +330,24 @@ impl<'a> Simulator<'a> {
             return Err(Error(format!(
                 "the N rate must be between 0 and 1 (got {})",
                 p.n_rate
+            )));
+        }
+        if !p.background_rate.is_finite() || !(0.0..=1.0).contains(&p.background_rate) {
+            return Err(Error(format!(
+                "the background rate must be between 0 and 1 (got {})",
+                p.background_rate
+            )));
+        }
+        if !p.unmapped_rate.is_finite() || !(0.0..=1.0).contains(&p.unmapped_rate) {
+            return Err(Error(format!(
+                "the unmapped rate must be between 0 and 1 (got {})",
+                p.unmapped_rate
+            )));
+        }
+        if p.background_rate + p.unmapped_rate > 1.0 {
+            return Err(Error(format!(
+                "background rate ({}) + unmapped rate ({}) must not exceed 1",
+                p.background_rate, p.unmapped_rate
             )));
         }
         check_name_field(&p.instrument, "instrument name")?;
@@ -406,7 +443,24 @@ impl<'a> Simulator<'a> {
             biases,
             molecules: p.library_molecules,
             molecule_seed: mix64(p.seed ^ 0x6D6F_6C65_6375_6C65),
+            background: None,
+            unmapped_threshold: threshold_u64(p.unmapped_rate),
+            background_threshold: threshold_u64(p.background_rate),
         })
+    }
+
+    /// Attaches an optional background transcriptome (for `--background-fasta`
+    /// and `--background-rate`).
+    pub fn with_background(mut self, bg: &'a Transcriptome) -> Result<Self> {
+        if bg.is_empty() {
+            return Err(Error("the background FASTA is empty".into()));
+        }
+        let weights: Vec<f64> = (0..bg.len())
+            .map(|i| self.fragment.effective_length(bg.length(i)).max(1.0))
+            .collect();
+        let table = AliasTable::new(&weights).map_err(Error)?;
+        self.background = Some((bg, table));
+        Ok(self)
     }
 
     /// Draws one fragment of the library: transcript, start, length, whether
@@ -505,13 +559,134 @@ impl<'a> Simulator<'a> {
         out.read2.reserve(record * n as usize);
 
         let plain = !self.biases.is_active() && self.molecules.is_none();
+        let has_extra = self.unmapped_threshold > 0 || self.background_threshold > 0;
+        let mut synth_buf: Vec<u8> = Vec::new();
         for _ in 0..n {
-            let (t, start, flen, whole, read1_forward);
-            if plain {
+            let mut truth_id: Option<&str> = None;
+            let (t_opt, start, flen, whole, read1_forward);
+            let extra_roll = if has_extra { rng.next_u64() } else { u64::MAX };
+            if has_extra && extra_roll < self.unmapped_threshold {
+                // Unmappable artifact: 70% random non-reference sequence (~46% GC),
+                // 30% heavily diverged transcript fragment (~30% substitution).
+                let l = self.fragment.sample(&mut rng);
+                read1_forward = self.library_type.read1_on_transcript_strand(&mut rng);
+                synth_buf.clear();
+                synth_buf.reserve(l);
+                if rng.next_u64() % 10 < 3 {
+                    let t = self.transcripts.sample(&mut rng);
+                    let transcript = self.transcriptome.sequence(t);
+                    let tlen = transcript.len();
+                    let (p, fl) = if l <= tlen {
+                        (rng.below((tlen - l + 1) as u64) as usize, l)
+                    } else {
+                        (0, tlen)
+                    };
+                    synth_buf.extend_from_slice(&transcript[p..p + fl]);
+                    for b in &mut synth_buf {
+                        if rng.next_u64() % 10 < 3 {
+                            *b = match (*b, (rng.next_u64() % 3) as u8) {
+                                (b'A', 0) => b'C',
+                                (b'A', 1) => b'G',
+                                (b'A', _) => b'T',
+                                (b'C', 0) => b'A',
+                                (b'C', 1) => b'G',
+                                (b'C', _) => b'T',
+                                (b'G', 0) => b'A',
+                                (b'G', 1) => b'C',
+                                (b'G', _) => b'T',
+                                (_, 0) => b'A',
+                                (_, 1) => b'C',
+                                _ => b'G',
+                            };
+                        }
+                    }
+                } else {
+                    // ~46% GC (23% G, 23% C, 27% A, 27% T)
+                    for _ in 0..l {
+                        let r = (rng.next_u64() % 100) as u8;
+                        synth_buf.push(if r < 27 {
+                            b'A'
+                        } else if r < 54 {
+                            b'T'
+                        } else if r < 77 {
+                            b'C'
+                        } else {
+                            b'G'
+                        });
+                    }
+                }
+                flen = synth_buf.len();
+                start = 0;
+                whole = false;
+                t_opt = None;
+                truth_id = Some("UNMAPPED");
+                stats.candidates += 1;
+                stats.unmapped_fragments += 1;
+                build_read(
+                    &mut template1,
+                    &synth_buf,
+                    read1_forward,
+                    &self.adapter1,
+                    self.fill,
+                    &mut rng,
+                );
+                build_read(
+                    &mut template2,
+                    &synth_buf,
+                    !read1_forward,
+                    &self.adapter2,
+                    self.fill,
+                    &mut rng,
+                );
+            } else if has_extra
+                && self.background_threshold > 0
+                && extra_roll.saturating_sub(self.unmapped_threshold) < self.background_threshold
+            {
+                let (bg, bg_table) = self
+                    .background
+                    .as_ref()
+                    .expect("background transcriptome checked when background_rate > 0");
+                let bt = bg_table.sample(&mut rng);
+                let seq = bg.sequence(bt);
+                let tlen = seq.len();
+                (start, flen, whole) = loop {
+                    let l = self.fragment.sample(&mut rng);
+                    let p = rng.below(tlen as u64) as usize;
+                    if l <= tlen {
+                        if p + l <= tlen {
+                            break (p, l, false);
+                        }
+                    } else if p == 0 {
+                        break (0, tlen, true);
+                    }
+                };
+                read1_forward = self.library_type.read1_on_transcript_strand(&mut rng);
+                t_opt = None;
+                truth_id = Some(bg.id(bt));
+                stats.candidates += 1;
+                stats.background_fragments += 1;
+                let fragment = &seq[start..start + flen];
+                build_read(
+                    &mut template1,
+                    fragment,
+                    read1_forward,
+                    &self.adapter1,
+                    self.fill,
+                    &mut rng,
+                );
+                build_read(
+                    &mut template2,
+                    fragment,
+                    !read1_forward,
+                    &self.adapter2,
+                    self.fill,
+                    &mut rng,
+                );
+            } else if plain {
                 // 1. transcript, 2. fragment length and start (rejection
                 // sampling of a uniform (start, length) pair inside the
                 // transcript).
-                t = self.transcripts.sample(&mut rng);
+                let t = self.transcripts.sample(&mut rng);
                 let transcript = self.transcriptome.sequence(t);
                 let tlen = transcript.len();
                 (start, flen, whole) = loop {
@@ -530,6 +705,7 @@ impl<'a> Simulator<'a> {
 
                 // 3. strand, 4. the two error-free reads.
                 read1_forward = self.library_type.read1_on_transcript_strand(&mut rng);
+                t_opt = Some(t);
                 build_read(
                     &mut template1,
                     fragment,
@@ -558,7 +734,9 @@ impl<'a> Simulator<'a> {
                     }
                     None => &mut rng,
                 };
+                let t;
                 (t, start, flen, whole, read1_forward) = self.draw_fragment(frng, stats);
+                t_opt = Some(t);
                 let fragment = &self.transcriptome.sequence(t)[start..start + flen];
                 build_read(
                     &mut template1,
@@ -577,7 +755,9 @@ impl<'a> Simulator<'a> {
                     frng,
                 );
             }
-            counts[t] += 1;
+            if let Some(t) = t_opt {
+                counts[t] += 1;
+            }
 
             // 5. name, 6. qualities and errors.
             let (tile, x, y) = cursor.next_coordinates(&mut rng);
@@ -611,7 +791,11 @@ impl<'a> Simulator<'a> {
                 let line = &mut out.truth;
                 line.extend_from_slice(&name[1..]);
                 line.push(b'\t');
-                line.extend_from_slice(self.transcriptome.id(t).as_bytes());
+                let id_str = match t_opt {
+                    Some(t) => self.transcriptome.id(t),
+                    None => truth_id.unwrap_or("UNMAPPED"),
+                };
+                line.extend_from_slice(id_str.as_bytes());
                 line.push(b'\t');
                 push_decimal(line, start as u64 + 1);
                 line.push(b'\t');
@@ -683,6 +867,7 @@ pub struct Config {
     pub abundance_type: AbundanceType,
     pub output_prefix: String,
     pub quality_profile: Option<PathBuf>,
+    pub background_fasta: Option<PathBuf>,
     pub reads: ReadParameters,
     pub threads: usize,
     /// Write gzip files (otherwise plain text).
@@ -995,6 +1180,9 @@ struct ReportParameters<'a> {
     degradation: Option<f64>,
     hexamer_bias: f64,
     library_molecules: Option<u64>,
+    background_fasta: Option<String>,
+    background_rate: f64,
+    unmapped_rate: f64,
 }
 
 #[derive(Serialize)]
@@ -1039,6 +1227,8 @@ struct ReportSummary {
     /// Expected share of read pairs that are the first read of their
     /// molecule (with --library-molecules).
     expected_unique_fraction: Option<f64>,
+    background_fragments: u64,
+    unmapped_fragments: u64,
 }
 
 #[derive(Serialize)]
@@ -1118,13 +1308,36 @@ pub fn run(config: &Config) -> Result<Outcome> {
         abundances.abundance_column,
         positive
     ));
-    let simulator = Simulator::new(
+    let background_tx = match &config.background_fasta {
+        Some(path) => {
+            let bg = Transcriptome::from_fasta(path)?;
+            log(&format!(
+                "read {} background sequences ({} bases) from {}",
+                bg.len(),
+                bg.total_bases(),
+                path.display()
+            ));
+            Some(bg)
+        }
+        None => {
+            if config.reads.background_rate > 0.0 {
+                return Err(Error(
+                    "--background-rate > 0 requires --background-fasta".into(),
+                ));
+            }
+            None
+        }
+    };
+    let mut simulator = Simulator::new(
         &transcriptome,
         &abundances.values,
         config.abundance_type,
         &profile,
         &config.reads,
     )?;
+    if let Some(bg) = &background_tx {
+        simulator = simulator.with_background(bg)?;
+    }
     if simulator.profile_extended() {
         log(&format!(
             "warning: the quality profile has fewer cycles than the read length ({}); \
@@ -1262,6 +1475,12 @@ pub fn run(config: &Config) -> Result<Outcome> {
             degradation: config.reads.biases.degradation,
             hexamer_bias: config.reads.biases.hexamer,
             library_molecules: config.reads.library_molecules,
+            background_fasta: config
+                .background_fasta
+                .as_ref()
+                .map(|p| p.display().to_string()),
+            background_rate: config.reads.background_rate,
+            unmapped_rate: config.reads.unmapped_rate,
         },
         resolved_adapter1: String::from_utf8_lossy(adapter1).into_owned(),
         resolved_adapter2: String::from_utf8_lossy(adapter2).into_owned(),
@@ -1309,6 +1528,8 @@ pub fn run(config: &Config) -> Result<Outcome> {
                 .reads
                 .library_molecules
                 .map(|m| expected_unique_fraction(stats.fragments, m)),
+            background_fragments: stats.background_fragments,
+            unmapped_fragments: stats.unmapped_fragments,
         },
         outputs: ReportOutputs {
             read1: &read1_path,

@@ -280,6 +280,30 @@ struct SimulateArgs {
     )]
     n_rate: f64,
 
+    /// Optional secondary FASTA of background / multicopy sequences (e.g. rRNA,
+    /// pseudogenes) sampled at --background-rate
+    #[arg(long, value_name = "FASTA", help_heading = "Background and artifacts")]
+    background_fasta: Option<PathBuf>,
+
+    /// Fraction of fragments drawn from --background-fasta (0 to 1)
+    #[arg(
+        long,
+        default_value_t = 0.0,
+        value_name = "PROBABILITY",
+        help_heading = "Background and artifacts"
+    )]
+    background_rate: f64,
+
+    /// Fraction of fragments simulated as unmappable non-reference or
+    /// heavily diverged sequencing artifacts (0 to 1)
+    #[arg(
+        long,
+        default_value_t = 0.0,
+        value_name = "PROBABILITY",
+        help_heading = "Background and artifacts"
+    )]
+    unmapped_rate: f64,
+
     /// Fragment GC fraction the library favours, between 0 and 1: candidate
     /// fragments are kept with probability exp(-((gc - CENTER) / WIDTH)^2 / 2)
     /// [default: no GC bias]
@@ -421,6 +445,7 @@ fn run_simulate(args: SimulateArgs) -> Result<()> {
         },
         output_prefix: args.output_prefix,
         quality_profile: args.quality_profile,
+        background_fasta: args.background_fasta,
         reads: ReadParameters {
             num_fragments: args.num_fragments,
             seed: args.seed,
@@ -456,6 +481,8 @@ fn run_simulate(args: SimulateArgs) -> Result<()> {
                 hexamer: args.hexamer_bias,
             },
             library_molecules: args.library_molecules,
+            background_rate: args.background_rate,
+            unmapped_rate: args.unmapped_rate,
         },
         threads,
         compress: !args.uncompressed,
